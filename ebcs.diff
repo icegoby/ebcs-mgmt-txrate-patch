@@ -1,0 +1,999 @@
+diff --git a/drivers/net/wireless/ath/ath10k/mac.c b/drivers/net/wireless/ath/ath10k/mac.c
+index 8208434d7..ff6b90a27 100644
+--- a/drivers/net/wireless/ath/ath10k/mac.c
++++ b/drivers/net/wireless/ath/ath10k/mac.c
+@@ -3875,6 +3875,67 @@ static void ath10k_mac_tx_h_fill_cb(struct ath10k *ar,
+ 	struct ath10k_sta *arsta;
+ 	u8 tid, *qos_ctl;
+ 	bool noack = false;
++#if 1   //  EBCS
++    static struct ieee80211_tx_rate cur_rate = {.idx = 0, .count = 0, .flags = 0};
++    struct ieee80211_tx_rate rate;
++    int rate_code;
++    u32 vdev_param;
++    int ret;
++
++    memcpy(&rate, info->control.rates, sizeof(rate));
++    memset((void *)info->control.rates, 0, sizeof(info->control.rates[0]));
++    if ((ieee80211_is_ebcs_info(hdr, skb->len) || ieee80211_is_ebcs_ul(hdr, skb->len)) && memcmp(&rate, &cur_rate, sizeof(rate))) {
++//printk("%s[%d]: idx %d.\n", __func__, __LINE__, info->control.rates[0].idx);
++        memcpy(&cur_rate, &rate, sizeof(cur_rate));
++
++        mutex_lock(&ar->conf_mutex);
++        if (rate.flags & IEEE80211_TX_RC_VHT_MCS) {     //  VHT
++            rate_code = ATH10K_HW_RATECODE(rate.idx & 0x0f, ((rate.idx & 0xf0) >> 4) - 1, WMI_RATE_PREAMBLE_VHT);
++        } else if (rate.flags & IEEE80211_TX_RC_MCS) {  //  HT
++            rate_code = ATH10K_HW_RATECODE(rate.idx % 8, rate.idx / 8, WMI_RATE_PREAMBLE_HT);
++        } else {
++            enum nl80211_band band;
++            struct ieee80211_supported_band *sband;
++            struct ieee80211_chanctx_conf *conf;
++
++            rcu_read_lock();
++            conf = rcu_dereference(vif->chanctx_conf);
++            if (conf == NULL) {
++                printk("%s[%d]: conf is NULL.\n", __func__, __LINE__);
++                rcu_read_unlock();
++                goto ebcs_out;
++            }
++            band = conf->def.chan->band;
++            rcu_read_unlock();
++
++//printk("%s[%d]: band %d\n", __func__, __LINE__, band);
++            sband = ar->hw->wiphy->bands[band];
++            if (rate.idx < 0 || rate.idx >= sband->n_bitrates) {
++                printk("%s[%d]: rate.idx %d >= n_bitrates %d\n", __func__, __LINE__, rate.idx, sband->n_bitrates);
++                goto ebcs_out;
++            }
++//printk("%s[%d]: bitrate %d.\n", __func__, __LINE__, sband->bitrates[rate.idx].bitrate);
++            rate_code = ath10k_mac_get_rate_hw_value(sband->bitrates[rate.idx].bitrate);
++            if (rate_code < 0) {
++                printk("%s[%d]: bitrate %d is not supported.\n", __func__, __LINE__, sband->bitrates[rate.idx].bitrate);
++                goto ebcs_out;
++            }
++        }
++
++        vdev_param = ar->wmi.vdev_param->mgmt_rate;
++        ret = ath10k_wmi_vdev_set_param(ar, arvif->vdev_id, vdev_param, rate_code);
++        usleep_range(5, 15);
++//printk("%s[%d]: rate_code 0x%02x.\n", __func__, __LINE__, rate_code);
++        if (ret < 0) {
++            printk("%s[%d]: failed to set mgmt rate_code to 0x%02x. (%d)\n", __func__, __LINE__, rate_code, ret);
++            goto ebcs_out;
++        }
++//printk("%s[%d]: succeeded to set mgmt rate_code to 0x%02x.\n", __func__, __LINE__, rate_code);
++        
++ebcs_out:
++        mutex_unlock(&ar->conf_mutex);
++    }
++#endif  //  EBCS
+ 
+ 	cb->flags = 0;
+ 	if (!ath10k_tx_h_use_hwcrypto(vif, skb))
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+index fa7de3e47..05bec1e49 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mac80211.c
+@@ -752,6 +752,7 @@ static void iwl_mvm_mac_tx(struct ieee80211_hw *hw,
+ 	bool offchannel = IEEE80211_SKB_CB(skb)->flags &
+ 		IEEE80211_TX_CTL_TX_OFFCHAN;
+ 
++//printk("%s[%d]: info->control.ratex[0].idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	if (iwl_mvm_is_radio_killed(mvm)) {
+ 		IWL_DEBUG_DROP(mvm, "Dropping - RF/CT KILL\n");
+ 		goto drop;
+@@ -784,6 +785,7 @@ static void iwl_mvm_mac_tx(struct ieee80211_hw *hw,
+ 		}
+ 	}
+ 
++//printk("%s[%d]: info->control.ratex[0].idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	iwl_mvm_tx_skb(mvm, skb, sta);
+ 	return;
+  drop:
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
+index e354918c2..1500b2edc 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/tx.c
+@@ -272,6 +272,7 @@ static u32 iwl_mvm_get_tx_rate(struct iwl_mvm *mvm,
+ 	/* info->control is only relevant for non HW rate control */
+ 	if (!ieee80211_hw_check(mvm->hw, HAS_RATE_CONTROL)) {
+ 		/* HT rate doesn't make sense for a non data frame */
++#if 0   //  EBCS
+ 		WARN_ONCE(info->control.rates[0].flags & IEEE80211_TX_RC_MCS &&
+ 			  !ieee80211_is_data(fc),
+ 			  "Got a HT rate (flags:0x%x/mcs:%d/fc:0x%x/state:%d) for a non data frame\n",
+@@ -279,10 +280,12 @@ static u32 iwl_mvm_get_tx_rate(struct iwl_mvm *mvm,
+ 			  info->control.rates[0].idx,
+ 			  le16_to_cpu(fc),
+ 			  sta ? iwl_mvm_sta_from_mac80211(sta)->sta_state : -1);
++#endif  //  EBCS
+ 
+ 		rate_idx = info->control.rates[0].idx;
+ 	}
+ 
++#if 0   // EBCS
+ 	/* if the rate isn't a well known legacy rate, take the lowest one */
+ 	if (rate_idx < 0 || rate_idx >= IWL_RATE_COUNT_LEGACY)
+ 		rate_idx = rate_lowest_index(
+@@ -304,6 +307,50 @@ static u32 iwl_mvm_get_tx_rate(struct iwl_mvm *mvm,
+ 	/* Set CCK flag as needed */
+ 	if ((rate_idx >= IWL_FIRST_CCK_RATE) && (rate_idx <= IWL_LAST_CCK_RATE))
+ 		rate_flags |= RATE_MCS_CCK_MSK;
++#else   // EBCS
++    rate_idx = info->control.rates[0].idx;
++//printk("%s[%d]: rate_idx %d\n", __func__, __LINE__, rate_idx);
++    if (info->control.rates[0].flags & IEEE80211_TX_RC_MCS) {
++//printk("%s[%d]: HT rate_idx %d\n", __func__, __LINE__, rate_idx);
++        rate_plcp = rate_idx;
++        if (info->band == NL80211_BAND_2GHZ &&
++                !iwl_mvm_bt_coex_is_shared_ant_avail(mvm)) {
++            rate_flags = mvm->cfg->non_shared_ant << RATE_MCS_ANT_POS;
++        } else {
++            rate_flags = BIT(mvm->mgmt_last_antenna_idx) << RATE_MCS_ANT_POS;
++        }
++        if (info->control.rates[0].flags & IEEE80211_TX_RC_40_MHZ_WIDTH)
++            rate_flags |= RATE_MCS_CHAN_WIDTH_40;
++        if (info->control.rates[0].flags & IEEE80211_TX_RC_SHORT_GI)
++            rate_flags |= RATE_MCS_SGI_MSK;
++        rate_flags |= RATE_MCS_HT_MSK;
++    } else {
++//printk("%s[%d]: legacy rate_idx %d IWL_RATE_COUNT_LEGACY %d\n", __func__, __LINE__, rate_idx, IWL_RATE_COUNT_LEGACY);
++        if (rate_idx < 0 || rate_idx >= IWL_RATE_COUNT_LEGACY)
++            rate_idx = rate_lowest_index(&mvm->nvm_data->bands[info->band], sta);
++
++        /* For 5 GHz band, remap mac80211 rate indices into driver indices */
++        if (info->band == NL80211_BAND_5GHZ)
++            rate_idx += IWL_FIRST_OFDM_RATE;
++
++        /* For 2.4 GHz band, check that there is no need to remap */
++        BUILD_BUG_ON(IWL_FIRST_CCK_RATE != 0);
++
++//printk("%s[%d]: rate_idx %d\n", __func__, __LINE__, rate_idx);
++        /* Get PLCP rate for tx_cmd->rate_n_flags */
++        rate_plcp = iwl_mvm_mac80211_idx_to_hwrate(rate_idx);
++
++        if (info->band == NL80211_BAND_2GHZ && !iwl_mvm_bt_coex_is_shared_ant_avail(mvm)) {
++            rate_flags = mvm->cfg->non_shared_ant << RATE_MCS_ANT_POS;
++        } else {
++            rate_flags = BIT(mvm->mgmt_last_antenna_idx) << RATE_MCS_ANT_POS;
++        }
++
++        /* Set CCK flag as needed */
++        if ((rate_idx >= IWL_FIRST_CCK_RATE) && (rate_idx <= IWL_LAST_CCK_RATE))
++            rate_flags |= RATE_MCS_CCK_MSK;
++    }
++#endif   // EBCS
+ 
+ 	return (u32)rate_plcp | rate_flags;
+ }
+@@ -323,6 +370,7 @@ void iwl_mvm_set_tx_cmd_rate(struct iwl_mvm *mvm, struct iwl_tx_cmd *tx_cmd,
+ 			    struct ieee80211_tx_info *info,
+ 			    struct ieee80211_sta *sta, __le16 fc)
+ {
++//printk("%s[%d]: info->control.rate[0].idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	/* Set retry limit on RTS packets */
+ 	tx_cmd->rts_retry_limit = IWL_RTS_DFAULT_RETRY_LIMIT;
+ 
+@@ -448,6 +496,7 @@ iwl_mvm_set_tx_params(struct iwl_mvm *mvm, struct sk_buff *skb,
+ 
+ 	dev_cmd = iwl_trans_alloc_tx_cmd(mvm->trans);
+ 
++//printk("%s[%d]: info->control.rate[0].idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	if (unlikely(!dev_cmd))
+ 		return NULL;
+ 
+@@ -485,6 +534,7 @@ iwl_mvm_set_tx_params(struct iwl_mvm *mvm, struct sk_buff *skb,
+ 		 */
+ 		if (!sta || !ieee80211_is_data(hdr->frame_control) ||
+ 		    mvmsta->sta_state < IEEE80211_STA_AUTHORIZED) {
++printk("%s[%d]: info->control.rate[0].idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 			flags |= IWL_TX_FLAGS_CMD_RATE;
+ 			rate_n_flags =
+ 				iwl_mvm_get_tx_rate_n_flags(mvm, info, sta,
+@@ -671,6 +721,7 @@ int iwl_mvm_tx_skb_non_sta(struct iwl_mvm *mvm, struct sk_buff *skb)
+ 
+ 	memcpy(&info, skb->cb, sizeof(info));
+ 
++//printk("%s[%d]: info->control.rate[0].idx %d\n", __func__, __LINE__, info.control.rates[0].idx);
+ 	if (WARN_ON_ONCE(skb->len > IEEE80211_MAX_DATA_LEN + hdrlen))
+ 		return -1;
+ 
+@@ -718,6 +769,7 @@ int iwl_mvm_tx_skb_non_sta(struct iwl_mvm *mvm, struct sk_buff *skb)
+ 
+ 	IWL_DEBUG_TX(mvm, "station Id %d, queue=%d\n", sta_id, queue);
+ 
++//printk("%s[%d]: info->control.rate[0].idx %d\n", __func__, __LINE__, info.control.rates[0].idx);
+ 	dev_cmd = iwl_mvm_set_tx_params(mvm, skb, &info, hdrlen, NULL, sta_id);
+ 	if (!dev_cmd)
+ 		return -1;
+@@ -1038,6 +1090,7 @@ static int iwl_mvm_tx_mpdu(struct iwl_mvm *mvm, struct sk_buff *skb,
+ 	if (unlikely(ieee80211_is_probe_resp(fc)))
+ 		iwl_mvm_probe_resp_set_noa(mvm, skb);
+ 
++printk("%s[%d]: info->control.rate[0].idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	dev_cmd = iwl_mvm_set_tx_params(mvm, skb, info, hdrlen,
+ 					sta, mvmsta->sta_id);
+ 	if (!dev_cmd)
+diff --git a/include/linux/ieee80211.h b/include/linux/ieee80211.h
+index 00ed7c176..b2de3a68c 100644
+--- a/include/linux/ieee80211.h
++++ b/include/linux/ieee80211.h
+@@ -1300,6 +1300,11 @@ struct ieee80211_mgmt {
+ 					u8 action_code;
+ 					u8 variable[];
+ 				} __packed s1g;
++#if 1   // EBCS
++                struct {
++                    u8 action_code;
++                } __packed ebcs;
++#endif  // EBCS
+ 			} u;
+ 		} __packed action;
+ 	} u;
+@@ -3194,6 +3199,10 @@ enum ieee80211_pub_actioncode {
+ 	WLAN_PUB_ACTION_FTM_REQUEST = 32,
+ 	WLAN_PUB_ACTION_FTM = 33,
+ 	WLAN_PUB_ACTION_FILS_DISCOVERY = 34,
++#if 1   // EBCS
++    WLAN_PUB_ACTION_EBCS_UL = 51,
++    WLAN_PUB_ACTION_EBCS_INFO = 52,
++#endif  // EBCS
+ };
+ 
+ /* TDLS action codes */
+@@ -3982,4 +3991,35 @@ enum ieee80211_range_params_max_total_ltf {
+ 	IEEE80211_RANGE_PARAMS_MAX_TOTAL_LTF_UNSPECIFIED,
+ };
+ 
++#if 1   // EBCS
++
++#define IEEE80211_EBCS_OUI_0    0x01
++#define IEEE80211_EBCS_OUI_1    0x0f
++#define IEEE80211_EBCS_OUI_2    0xac
++#define IEEE80211_EBCS_OUI { \
++    IEEE80211_EBCS_OUI_0, \
++    IEEE80211_EBCS_OUI_1, \
++    IEEE80211_EBCS_OUI_2, \
++}
++
++static inline bool ieee80211_is_ebcs_info(struct ieee80211_hdr *hdr, int len) {
++    const u8 ebcs_oui[] = IEEE80211_EBCS_OUI;
++    struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)hdr;
++
++    return (ieee80211_is_public_action(hdr, len)
++            && (mgmt->u.action.u.ebcs.action_code == WLAN_PUB_ACTION_EBCS_INFO)
++            && !memcmp(mgmt->bssid, ebcs_oui, sizeof(ebcs_oui)));
++}
++
++static inline bool ieee80211_is_ebcs_ul(struct ieee80211_hdr *hdr, int len) {
++    const u8 ebcs_oui[] = IEEE80211_EBCS_OUI;
++    struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)hdr;
++
++    return (ieee80211_is_public_action(hdr, len)
++            && (mgmt->u.action.u.ebcs.action_code == WLAN_PUB_ACTION_EBCS_UL)
++            && !memcmp(mgmt->bssid, ebcs_oui, sizeof(ebcs_oui)));
++}
++
++#endif  // EBCS
++
+ #endif /* LINUX_IEEE80211_H */
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index 27336fc70..e39d32d06 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -3174,6 +3174,66 @@ struct cfg80211_update_ft_ies_params {
+ 	size_t ie_len;
+ };
+ 
++#if 1   // EBCS
++
++enum cfg80211_phy_type {
++    CFG80211_PHY_TYPE_DEFAULT,
++    CFG80211_PHY_TYPE_LEGACY,
++    CFG80211_PHY_TYPE_HT,
++    CFG80211_PHY_TYPE_VHT,
++    CFG80211_PHY_TYPE_HE,
++    __CFG80211_PHY_TYPE_MAX,
++};
++
++enum cfg80211_txrate_gi {
++    CFG80211_TXRATE_DEFAULT_GI,
++    CFG80211_TXRATE_FORCE_SGI,
++    CFG80211_TXRATE_FORCE_LGI,
++};
++
++enum cfg80211_he_gi {
++    CFG80211_HE_GI_0_8,
++    CFG80211_HE_GI_1_6,
++    CFG80211_HE_GI_3_2,
++};
++
++enum cfg80211_he_ltf {
++    CFG80211_HE_1XLTF,
++    CFG80211_HE_2XLTF,
++    CFG80211_HE_4XLTF,
++};
++
++struct cfg80211_ebcs_txrate_ht {
++    u8 mcs;
++    enum cfg80211_txrate_gi gi;
++};
++
++struct cfg80211_ebcs_txrate_vht {
++    u8 mcs;
++    u8 nss;
++    enum cfg80211_txrate_gi gi;
++};
++
++struct cfg80211_ebcs_txrate_he {
++    u8 mcs;
++    u8 nss;
++    enum cfg80211_he_gi gi;
++    enum cfg80211_he_ltf ltf;
++};
++
++struct cfg80211_ebcs_txrate {
++    enum cfg80211_phy_type phy;
++    enum rate_info_bw bandwidth;
++    union {
++        u32 legacy_rate;                            // a/b/g 100kbps
++        struct cfg80211_ebcs_txrate_ht ht_rate;     // n
++        struct cfg80211_ebcs_txrate_vht vht_rate;   // ac
++        struct cfg80211_ebcs_txrate_he he_rate;     // ax
++    };
++};
++
++#endif  // EBCS
++
+ /**
+  * struct cfg80211_mgmt_tx_params - mgmt tx parameters
+  *
+@@ -3199,6 +3259,9 @@ struct cfg80211_mgmt_tx_params {
+ 	bool dont_wait_for_ack;
+ 	int n_csa_offsets;
+ 	const u16 *csa_offsets;
++#if 1   // EBCS
++    struct cfg80211_ebcs_txrate rate;
++#endif  // EBCS
+ };
+ 
+ /**
+diff --git a/include/uapi/linux/nl80211.h b/include/uapi/linux/nl80211.h
+index c2efea98e..3c2b940ca 100644
+--- a/include/uapi/linux/nl80211.h
++++ b/include/uapi/linux/nl80211.h
+@@ -3096,6 +3096,10 @@ enum nl80211_attrs {
+ 	NL80211_ATTR_COLOR_CHANGE_COLOR,
+ 	NL80211_ATTR_COLOR_CHANGE_ELEMS,
+ 
++#if 1   // EBCS
++    NL80211_ATTR_EBCS_TXRATE,
++#endif  // EBCS
++
+ 	/* add attributes here, update the policy in nl80211.c */
+ 
+ 	__NL80211_ATTR_AFTER_LAST,
+@@ -7349,4 +7353,36 @@ enum nl80211_sar_specs_attrs {
+ 	NL80211_SAR_ATTR_SPECS_MAX = __NL80211_SAR_ATTR_SPECS_LAST - 1,
+ };
+ 
++#if 1   // EBCS
++
++struct nl80211_ebcs_txrate_ht {
++    __u8 mcs;
++    __u8 gi;                // enum nl80211_txrate_gi
++} __attribute__((packed));
++
++struct nl80211_ebcs_txrate_vht {
++    __u8 mcs;
++    __u8 nss;
++    __u8 gi;                // enum nl80211_txrate_gi
++} __attribute__((packed));
++
++struct nl80211_ebcs_txrate_he {
++    __u8 mcs;
++    __u8 nss;
++    __u8 gi;                // enum nl80211_he_gi
++    __u8 ltf;               // enum nl80211_he_ltf
++} __attribute__((packed));
++
++struct nl80211_ebcs_txrate {
++    __u8 phy;               // enum nl80211_tx_rate_attributes (LEGACY / HT / VHT / HE only)
++    __u8 bandwidth;         // enum nl80211_chan_width
++    union {
++        __u32 legacy_rate;
++        struct nl80211_ebcs_txrate_ht ht_rate;
++        struct nl80211_ebcs_txrate_vht vht_rate;
++        struct nl80211_ebcs_txrate_he he_rate;
++    };
++} __attribute__((packed));
++
++#endif  // EBCS
+ #endif /* __LINUX_NL80211_H */
+diff --git a/net/mac80211/offchannel.c b/net/mac80211/offchannel.c
+index 853c9a369..c1f13278e 100644
+--- a/net/mac80211/offchannel.c
++++ b/net/mac80211/offchannel.c
+@@ -761,6 +761,28 @@ int ieee80211_cancel_remain_on_channel(struct wiphy *wiphy,
+ 	return ieee80211_cancel_roc(local, cookie, false);
+ }
+ 
++#if 0
++static void dump_skb(struct sk_buff *skb) {
++    int i;
++    char buf[256], buf2[256];
++
++    printk("%s[%d]: skb_dump\n", __func__, __LINE__);
++    for (i = 0; i < skb->len; i++) {
++        if (i == 0) {
++            sprintf(buf, "%08x: ", i);
++        } else if (i % 16 == 0) {
++            printk(buf);
++            sprintf(buf, "%08x: ", i);
++        } else if (i % 8 == 0) {
++            strcat(buf, " :");
++        }
++        sprintf(buf2, " %02x", skb->data[i]);
++        strcat(buf, buf2);
++    }
++    printk(buf);
++}
++#endif
++
+ int ieee80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 		      struct cfg80211_mgmt_tx_params *params, u64 *cookie)
+ {
+@@ -773,6 +795,13 @@ int ieee80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 	u32 flags;
+ 	int ret;
+ 	u8 *data;
++#if 1   // EBCS
++    bool ebcs = false;
++    struct ieee80211_supported_band *sband = ieee80211_get_sband(sdata);
++    // struct ieee80211_tx_rate *rate;
++    struct ieee80211_tx_info *info;
++    int i;
++#endif  // EBCS
+ 
+ 	if (params->dont_wait_for_ack)
+ 		flags = IEEE80211_TX_CTL_NO_ACK;
+@@ -838,6 +867,12 @@ int ieee80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 	if (need_offchan && !params->chan)
+ 		return -EINVAL;
+ 
++#if 1   // EBCS
++    if (ieee80211_is_ebcs_info((struct ieee80211_hdr *)mgmt, params->len)
++            || ieee80211_is_ebcs_ul((struct ieee80211_hdr *)mgmt, params->len))
++        ebcs = true;
++#endif  // EBCS
++
+ 	mutex_lock(&local->mtx);
+ 
+ 	/* Check if the operating channel is the requested channel */
+@@ -866,13 +901,186 @@ int ieee80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 		goto out_unlock;
+ 	}
+ 
++#if 0   // EBCS
++    if (ebcs) {
++        skb = dev_alloc_skb(local->hw.extra_tx_headroom + sizeof(struct ieee80211_tx_rate) + params->len);
++    } else {
++        skb = dev_alloc_skb(local->hw.extra_tx_headroom + params->len);
++    }
++#else   // EBCS
+ 	skb = dev_alloc_skb(local->hw.extra_tx_headroom + params->len);
++#endif  // EBCS
++
+ 	if (!skb) {
+ 		ret = -ENOMEM;
+ 		goto out_unlock;
+ 	}
++
+ 	skb_reserve(skb, local->hw.extra_tx_headroom);
+ 
++#if 1   // EBCS
++    if (ebcs) {
++        info = IEEE80211_SKB_CB(skb);
++        // rate = &info->control.rates[0];
++        // memset(&rate, 0, sizeof(*rate));
++        for (i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
++            info->control.rates[i].idx = -1;
++            info->control.rates[i].flags = 0;
++            info->control.rates[i].count = 0;
++        }
++#if 0
++        if (ieee80211_hw_check(&(local->hw), HAS_RATE_CONTROL)) {
++            printk("%s[%d]: HW has rate control.\n", __func__, __LINE__);
++        } else {
++            printk("%s[%d]: HW does NOT have rate control.\n", __func__, __LINE__);
++        }
++#endif
++        if (sband) {
++            int byte, bit, max_nss;
++            enum ieee80211_vht_chanwidth bw;
++            struct ieee80211_vht_cap vht_cap;
++            u8 nss, mcs;
++
++            switch (params->rate.phy) {
++            case CFG80211_PHY_TYPE_LEGACY:
++                printk("%s[%d]: n_bitrates %d params legacy_rate %d.\n", __func__, __LINE__, sband->n_bitrates, params->rate.legacy_rate);
++                for (i = 0; i < sband->n_bitrates; i++) {
++                    printk("%s[%d]: bitrates[%d] flags 0x%08x bitrate %d.\n", __func__, __LINE__, i, sband->bitrates[i].flags, sband->bitrates[i].bitrate);
++                    if (sband->bitrates[i].bitrate == params->rate.legacy_rate) {
++                        printk("%s[%d]: idx %d.\n", __func__, __LINE__, i);
++                        info->control.rates[0].idx = i;
++                        break;
++                    }
++                }
++                if (params->rate.bandwidth != RATE_INFO_BW_20) {
++                    printk("%s[%d]: Bandwidth %d is not supported.\n", __func__, __LINE__, params->rate.bandwidth);
++                    ret = -ENOTSUPP;
++                    goto out_unlock;
++                }
++                break;
++            case CFG80211_PHY_TYPE_HT:
++                if (!sband->ht_cap.ht_supported) {
++                    printk("%s[%d]: HT not supported.\n", __func__, __LINE__);
++                    ret = -ENOTSUPP;
++                    goto out_unlock;
++                }
++                byte = params->rate.ht_rate.mcs / 8;
++                bit = params->rate.ht_rate.mcs % 8;
++#if 0
++                printk("%s[%d]: HT cap %04x mcs", __func__, __LINE__, sband->ht_cap.cap);
++                for (i = 0; i < IEEE80211_HT_MCS_MASK_LEN; i++) {
++                    printk(" 0x%02x", sband->ht_cap.mcs.rx_mask[i]);
++                }
++                printk(" tx_params 0x%02x.\n", sband->ht_cap.mcs.tx_params);
++#endif
++                if (byte >= IEEE80211_HT_MCS_MASK_LEN) {
++                    printk("%s[%d]: byte (%d) >= IEEE80211_HT_MCS_MASK_LEN (%d)\n", __func__, __LINE__, byte, IEEE80211_HT_MCS_MASK_LEN);
++                    ret = -ENOTSUPP;
++                    goto out_unlock;
++                }
++                if (!(sband->ht_cap.mcs.rx_mask[byte] & (0x1 << bit))) {
++                    printk("%s[%d]: HT MCS %d is not supported.\n", __func__, __LINE__, params->rate.ht_rate.mcs);
++                    ret = -ENOTSUPP;
++                    goto out_unlock;
++                }
++                info->control.rates[0].flags |= IEEE80211_TX_RC_MCS;
++                info->control.rates[0].idx = params->rate.ht_rate.mcs;
++                info->control.rates[0].count = 1;
++                switch (params->rate.bandwidth) {
++                case RATE_INFO_BW_20:
++                    break;
++                case RATE_INFO_BW_40:
++                    info->control.rates[0].flags |= IEEE80211_TX_RC_40_MHZ_WIDTH;
++                    break;
++                default:
++                    printk("%s[%d]: Bandwidth %d is not supported.\n", __func__, __LINE__, params->rate.bandwidth);
++                    ret = -ENOTSUPP;
++                    goto out_unlock;
++                }
++                break;
++            case CFG80211_PHY_TYPE_VHT:
++                if (!sband->vht_cap.vht_supported) {
++                    printk("%s[%d]: VHT not supported.\n", __func__, __LINE__);
++                    ret = -ENOTSUPP;
++                    goto out_unlock;
++                }
++                printk("%s[%d]: VHT cap 0x%08x rx map 0x%04x highest 0x%04x tx map 0x%04x highest 0x%04x.\n", __func__, __LINE__, sband->vht_cap.cap, sband->vht_cap.vht_mcs.rx_mcs_map, sband->vht_cap.vht_mcs.rx_highest, sband->vht_cap.vht_mcs.tx_mcs_map, sband->vht_cap.vht_mcs.tx_highest);
++                switch (params->rate.bandwidth) {
++                case RATE_INFO_BW_20:
++                    bw = IEEE80211_VHT_CHANWIDTH_USE_HT;
++                    break;
++                case RATE_INFO_BW_40:
++                    bw = IEEE80211_VHT_CHANWIDTH_USE_HT;
++                    info->control.rates[0].flags |= IEEE80211_TX_RC_40_MHZ_WIDTH;
++                    break;
++                case RATE_INFO_BW_80:
++                    bw = IEEE80211_VHT_CHANWIDTH_80MHZ;
++                    info->control.rates[0].flags |= IEEE80211_TX_RC_80_MHZ_WIDTH;
++                    break;
++                case RATE_INFO_BW_160:
++                    bw = IEEE80211_VHT_CHANWIDTH_160MHZ;
++                    info->control.rates[0].flags |= IEEE80211_TX_RC_160_MHZ_WIDTH;
++                    break;
++                default:
++                    printk("%s[%d]: Bandwidth %d is not supported.\n", __func__, __LINE__, params->rate.bandwidth);
++                    ret = -ENOTSUPP;
++                    goto out_unlock;
++                }
++                mcs = params->rate.vht_rate.mcs;
++                nss = params->rate.vht_rate.nss;
++                switch ((sband->vht_cap.vht_mcs.tx_mcs_map & (0x03 << ((nss - 1) * 2))) >> ((nss - 1) * 2)) {
++                case 0:
++                    if (mcs > 7) {
++                        printk("%s[%d]: VHT MCS %d NSS %d is not supported.\n", __func__, __LINE__, mcs, nss);
++                        ret = -ENOTSUPP;
++                        goto out_unlock;
++                    }
++                    break;
++                case 1:
++                    if (mcs > 8) {
++                        printk("%s[%d]: VHT MCS %d NSS %d is not supported.\n", __func__, __LINE__, mcs, nss);
++                        ret = -ENOTSUPP;
++                        goto out_unlock;
++                    }
++                    break;
++                case 2:
++                    if (mcs > 9) {
++                        printk("%s[%d]: VHT MCS %d NSS %d is not supported.\n", __func__, __LINE__, mcs, nss);
++                        ret = -ENOTSUPP;
++                        goto out_unlock;
++                    }
++                    break;
++                default:
++                    printk("%s[%d]: VHT MCS %d NSS %d is not supported.\n", __func__, __LINE__, mcs, nss);
++                    ret = -ENOTSUPP;
++                    goto out_unlock;
++                }
++                vht_cap.vht_cap_info = sband->vht_cap.cap;
++                vht_cap.supp_mcs.rx_mcs_map = sband->vht_cap.vht_mcs.rx_mcs_map;
++                vht_cap.supp_mcs.rx_highest = sband->vht_cap.vht_mcs.rx_highest;
++                vht_cap.supp_mcs.tx_mcs_map = sband->vht_cap.vht_mcs.tx_mcs_map;
++                vht_cap.supp_mcs.tx_highest = sband->vht_cap.vht_mcs.tx_highest;
++                max_nss = ieee80211_get_vht_max_nss(&vht_cap, bw, params->rate.vht_rate.mcs, false, 0);
++                printk("%s[%d]: VHT max_nss %d\n", __func__, __LINE__, max_nss);
++                if (params->rate.vht_rate.nss > max_nss) {
++                    printk("%s[%d]: specified nss %d > max_nss %d\n", __func__, __LINE__, params->rate.vht_rate.nss, max_nss);
++                    ret = -ENOTSUPP;
++                    goto out_unlock;
++                }
++                info->control.rates[0].flags |= IEEE80211_TX_RC_VHT_MCS;
++                info->control.rates[0].idx = mcs | (nss << 4);
++                info->control.rates[0].count = 1;
++                break;
++            default:
++                printk("%s[%d]: PHY %d is not supported.\n", __func__, __LINE__, params->rate.phy);
++                ret = -ENOTSUPP;
++                goto out_unlock;
++            }
++        }
++    }
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, IEEE80211_SKB_CB(skb)->control.rates[0].idx);
++#endif  // EBCS
++
+ 	data = skb_put_data(skb, params->buf, params->len);
+ 
+ 	/* Update CSA counters */
+@@ -923,7 +1131,9 @@ int ieee80211_mgmt_tx(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 		*cookie = 0xffffffff;
+ 	}
+ 
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, IEEE80211_SKB_CB(skb)->control.rates[0].idx);
+ 	if (!need_offchan) {
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, IEEE80211_SKB_CB(skb)->control.rates[0].idx);
+ 		ieee80211_tx_skb(sdata, skb);
+ 		ret = 0;
+ 		goto out_unlock;
+diff --git a/net/mac80211/tx.c b/net/mac80211/tx.c
+index 8f8dc2625..bbb8055cf 100644
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -670,7 +670,12 @@ ieee80211_tx_h_rate_ctrl(struct ieee80211_tx_data *tx)
+ 	bool encap = info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP;
+ 	bool assoc = false;
+ 
+-	memset(&txrc, 0, sizeof(txrc));
++#if 1   //  EBCS
++    if (ieee80211_is_ebcs_info(hdr, tx->skb->len) || ieee80211_is_ebcs_ul(hdr, tx->skb->len))
++        return TX_CONTINUE;
++#endif  //  EBCS
++
++    memset(&txrc, 0, sizeof(txrc));
+ 
+ 	sband = tx->local->hw.wiphy->bands[info->band];
+ 
+@@ -1710,6 +1715,7 @@ static bool ieee80211_tx_frags(struct ieee80211_local *local,
+ 		control.sta = sta ? &sta->sta : NULL;
+ 
+ 		__skb_unlink(skb, skbs);
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 		drv_tx(local, &control, skb);
+ 	}
+ 
+@@ -1734,6 +1740,7 @@ static bool __ieee80211_tx(struct ieee80211_local *local,
+ 
+ 	skb = skb_peek(skbs);
+ 	info = IEEE80211_SKB_CB(skb);
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	sdata = vif_to_sdata(info->control.vif);
+ 	if (sta && !sta->uploaded)
+ 		sta = NULL;
+@@ -1921,6 +1928,7 @@ static bool ieee80211_tx(struct ieee80211_sub_if_data *sdata,
+ 		return true;
+ 	}
+ 
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	/* initialises tx */
+ 	res_prepare = ieee80211_tx_prepare(sdata, &tx, sta, skb);
+ 
+@@ -1931,18 +1939,22 @@ static bool ieee80211_tx(struct ieee80211_sub_if_data *sdata,
+ 		return true;
+ 	}
+ 
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	/* set up hw_queue value early */
+ 	if (!(info->flags & IEEE80211_TX_CTL_TX_OFFCHAN) ||
+ 	    !ieee80211_hw_check(&local->hw, QUEUE_CONTROL))
+ 		info->hw_queue =
+ 			sdata->vif.hw_queue[skb_get_queue_mapping(skb)];
+ 
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	if (invoke_tx_handlers_early(&tx))
+ 		return true;
+ 
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	if (ieee80211_queue_skb(local, sdata, tx.sta, tx.skb))
+ 		return true;
+ 
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	if (!invoke_tx_handlers_late(&tx))
+ 		result = __ieee80211_tx(local, &tx.skbs, tx.sta, txpending);
+ 
+@@ -2010,12 +2022,14 @@ void ieee80211_xmit(struct ieee80211_sub_if_data *sdata,
+ 	else
+ 		encrypt = ENCRYPT_DATA;
+ 
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	headroom = local->tx_headroom;
+ 	if (encrypt != ENCRYPT_NO)
+ 		headroom += sdata->encrypt_headroom;
+ 	headroom -= skb_headroom(skb);
+ 	headroom = max_t(int, 0, headroom);
+ 
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	if (ieee80211_skb_resize(sdata, skb, headroom, encrypt)) {
+ 		ieee80211_free_txskb(&local->hw, skb);
+ 		return;
+@@ -2036,6 +2050,7 @@ void ieee80211_xmit(struct ieee80211_sub_if_data *sdata,
+ 	}
+ 
+ 	ieee80211_set_qos_hdr(sdata, skb);
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, info->control.rates[0].idx);
+ 	ieee80211_tx(sdata, sta, skb, false);
+ }
+ 
+@@ -5651,6 +5666,7 @@ void __ieee80211_tx_skb_tid_band(struct ieee80211_sub_if_data *sdata,
+ {
+ 	int ac = ieee80211_ac_from_tid(tid);
+ 
++//printk("%s[%d]: idx %d\n", __func__, __LINE__, IEEE80211_SKB_CB(skb)->control.rates[0].idx);
+ 	skb_reset_mac_header(skb);
+ 	skb_set_queue_mapping(skb, ac);
+ 	skb->priority = tid;
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index 1b91a9c20..b2f92bc67 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -764,6 +764,10 @@ static const struct nla_policy nl80211_policy[NUM_NL80211_ATTR] = {
+ 	[NL80211_ATTR_COLOR_CHANGE_COUNT] = { .type = NLA_U8 },
+ 	[NL80211_ATTR_COLOR_CHANGE_COLOR] = { .type = NLA_U8 },
+ 	[NL80211_ATTR_COLOR_CHANGE_ELEMS] = NLA_POLICY_NESTED(nl80211_policy),
++#if 1   // EBCS
++    [NL80211_ATTR_EBCS_TXRATE] = { .type = NLA_BINARY,
++        .len = sizeof(struct nl80211_ebcs_txrate)},
++#endif  // EBCS
+ };
+ 
+ /* policy for the key attributes */
+@@ -11407,6 +11411,200 @@ static int nl80211_register_mgmt(struct sk_buff *skb, struct genl_info *info)
+ 					   info->extack);
+ }
+ 
++#if 1   // EBCS
++
++static int nl80211_parse_ebcs_txrate(struct genl_info *info,
++                                     struct cfg80211_mgmt_tx_params *params,
++                                     struct net_device *dev)
++{
++    struct nlattr **attrs = info->attrs;
++    struct nl80211_ebcs_txrate *nlrate;
++    struct cfg80211_ebcs_txrate *rate = &(params->rate);
++
++    if (!attrs[NL80211_ATTR_EBCS_TXRATE]) {
++        printk("%s[%d]: NL80211_ATTR_EBCS_TXRATE is not found.\n", __func__, __LINE__);
++        return -EINVAL;
++    }
++
++    nlrate = nla_data(attrs[NL80211_ATTR_EBCS_TXRATE]);
++
++    switch (nlrate->phy) {
++    case NL80211_TXRATE_LEGACY:
++        rate->phy = CFG80211_PHY_TYPE_LEGACY;
++        if (nlrate->bandwidth != NL80211_CHAN_WIDTH_20) {
++            printk("%s[%d]: bandwidth is invalid. (%d)\n", __func__, __LINE__, nlrate->bandwidth);
++            return -EINVAL;
++        }
++        rate->bandwidth = RATE_INFO_BW_20;
++        switch (nlrate->legacy_rate) {
++        case 10:
++        case 20:
++        case 55:
++        case 60:
++        case 90:
++        case 110:
++        case 120:
++        case 180:
++        case 240:
++        case 360:
++        case 480:
++        case 540:
++            break;
++        default:
++            printk("%s[%d]: legacy_rate is invalid. (%d)\n", __func__, __LINE__, nlrate->legacy_rate);
++            return -EINVAL;
++        }
++        rate->legacy_rate = nlrate->legacy_rate;
++        printk("%s[%d]: legacy %d.\n", __func__, __LINE__, rate->legacy_rate);
++        break;
++    case NL80211_TXRATE_HT:
++        rate->phy = CFG80211_PHY_TYPE_HT;
++        switch (nlrate->bandwidth) {
++        case NL80211_CHAN_WIDTH_20:
++            rate->bandwidth = RATE_INFO_BW_20;
++            break;
++        case NL80211_CHAN_WIDTH_40:
++            rate->bandwidth = RATE_INFO_BW_40;
++            break;
++        default:
++            printk("%s[%d]: HT bandwidth is invalid. (%d)\n", __func__, __LINE__, nlrate->bandwidth);
++            return -EINVAL;
++        }
++        if (nlrate->ht_rate.mcs > 76) {
++            printk("%s[%d]: HT MCS is invalid. (%d)\n", __func__, __LINE__, nlrate->ht_rate.mcs);
++            return -EINVAL;
++        }
++        rate->ht_rate.mcs = nlrate->ht_rate.mcs;
++        switch (nlrate->ht_rate.gi) {
++        case NL80211_TXRATE_DEFAULT_GI:
++            rate->ht_rate.gi = CFG80211_TXRATE_DEFAULT_GI;
++            break;
++        case NL80211_TXRATE_FORCE_SGI:
++            rate->ht_rate.gi = CFG80211_TXRATE_FORCE_SGI;
++            break;
++        case NL80211_TXRATE_FORCE_LGI:
++            rate->ht_rate.gi = CFG80211_TXRATE_FORCE_LGI;
++            break;
++        default:
++            printk("%s[%d]: HT GI is invalid. (%d)\n", __func__, __LINE__, nlrate->ht_rate.gi);
++            return -EINVAL;
++        }
++//printk("%s[%d]: HT MCS %d BW %d GI %d.\n", __func__, __LINE__, rate->ht_rate.mcs, rate->bandwidth, rate->ht_rate.gi);
++        break;
++    case NL80211_TXRATE_VHT:
++        rate->phy = CFG80211_PHY_TYPE_VHT;
++        switch (nlrate->bandwidth) {
++        case NL80211_CHAN_WIDTH_20:
++            rate->bandwidth = RATE_INFO_BW_20;
++            break;
++        case NL80211_CHAN_WIDTH_40:
++            rate->bandwidth = RATE_INFO_BW_40;
++            break;
++        case NL80211_CHAN_WIDTH_80:
++            rate->bandwidth = RATE_INFO_BW_80;
++            break;
++        case NL80211_CHAN_WIDTH_160:
++            rate->bandwidth = RATE_INFO_BW_160;
++            break;
++        default:
++            printk("%s[%d]: VHT bandwidth is invalid. (%d)\n", __func__, __LINE__, nlrate->bandwidth);
++            return -EINVAL;
++        }
++        if (nlrate->vht_rate.mcs > 9) {
++            printk("%s[%d]: VHT MCS is invalid. (%d)\n", __func__, __LINE__, nlrate->vht_rate.mcs);
++            return -EINVAL;
++        }
++        rate->vht_rate.mcs = nlrate->vht_rate.mcs;
++        if (nlrate->vht_rate.nss < 1 || nlrate->vht_rate.nss > 4) {
++            printk("%s[%d]: VHT NSS is invalid. (%d)\n", __func__, __LINE__, nlrate->vht_rate.nss);
++            return -EINVAL;
++        }
++        rate->vht_rate.nss = nlrate->vht_rate.nss;
++        switch (nlrate->vht_rate.gi) {
++        case NL80211_TXRATE_DEFAULT_GI:
++            rate->vht_rate.gi = CFG80211_TXRATE_DEFAULT_GI;
++            break;
++        case NL80211_TXRATE_FORCE_SGI:
++            rate->vht_rate.gi = CFG80211_TXRATE_FORCE_SGI;
++            break;
++        case NL80211_TXRATE_FORCE_LGI:
++            rate->vht_rate.gi = CFG80211_TXRATE_FORCE_LGI;
++            break;
++        default:
++            printk("%s[%d]: VHT GI is invalid. (%d)\n", __func__, __LINE__, nlrate->vht_rate.gi);
++            return -EINVAL;
++        }
++        printk("%s[%d]: VHT MCS %d NSS %d BW %d GI %d.\n", __func__, __LINE__, rate->vht_rate.mcs, rate->vht_rate.nss, rate->bandwidth, rate->vht_rate.gi);
++        break;
++    case NL80211_TXRATE_HE:
++        rate->phy = CFG80211_PHY_TYPE_HE;
++        switch (nlrate->bandwidth) {
++        case NL80211_CHAN_WIDTH_20:
++            rate->bandwidth = RATE_INFO_BW_20;
++            break;
++        case NL80211_CHAN_WIDTH_40:
++            rate->bandwidth = RATE_INFO_BW_40;
++            break;
++        case NL80211_CHAN_WIDTH_80:
++            rate->bandwidth = RATE_INFO_BW_80;
++            break;
++        case NL80211_CHAN_WIDTH_160:
++            rate->bandwidth = RATE_INFO_BW_160;
++            break;
++        default:
++            printk("%s[%d]: HE bandwidth is invalid. (%d)\n", __func__, __LINE__, nlrate->bandwidth);
++            return -EINVAL;
++        }
++        if (nlrate->he_rate.mcs > 11) {
++            printk("%s[%d]: HE MCS is invalid. (%d)\n", __func__, __LINE__, nlrate->he_rate.mcs);
++            return -EINVAL;
++        }
++        rate->he_rate.mcs = nlrate->he_rate.mcs;
++        if (nlrate->he_rate.nss < 1 || nlrate->he_rate.nss > 8) {
++            printk("%s[%d]: HE NSS is invalid. (%d)\n", __func__, __LINE__, nlrate->he_rate.nss);
++            return -EINVAL;
++        }
++        rate->he_rate.nss = nlrate->he_rate.nss;
++        switch (nlrate->he_rate.gi) {
++        case NL80211_RATE_INFO_HE_GI_0_8:
++            rate->he_rate.gi = CFG80211_HE_GI_0_8;
++            break;
++        case NL80211_RATE_INFO_HE_GI_1_6:
++            rate->he_rate.gi = CFG80211_HE_GI_1_6;
++            break;
++        case NL80211_RATE_INFO_HE_GI_3_2:
++            rate->he_rate.gi = CFG80211_HE_GI_3_2;
++            break;
++        default:
++            printk("%s[%d]: HE GI is invalid. (%d)\n", __func__, __LINE__, nlrate->he_rate.gi);
++            return -EINVAL;
++        }
++        switch (nlrate->he_rate.ltf) {
++        case NL80211_RATE_INFO_HE_1XLTF:
++            rate->he_rate.ltf = CFG80211_HE_1XLTF;
++            break;
++        case NL80211_RATE_INFO_HE_2XLTF:
++            rate->he_rate.ltf = CFG80211_HE_2XLTF;
++            break;
++        case NL80211_RATE_INFO_HE_4XLTF:
++            rate->he_rate.ltf = CFG80211_HE_4XLTF;
++            break;
++        default:
++            printk("%s[%d]: HE LTF is invalid. (%d)\n", __func__, __LINE__, nlrate->he_rate.ltf);
++            return -EINVAL;
++        }
++        printk("%s[%d]: HE MCS %d NSS %d BW %d GI %d LTF %d.\n", __func__, __LINE__, rate->he_rate.mcs, rate->he_rate.nss, rate->bandwidth, rate->he_rate.gi, rate->he_rate.ltf);
++        break;
++    default:
++        printk("%s[%d]: unknown phy. (%d)\n", __func__, __LINE__, rate->phy);
++        return -EINVAL;
++    }
++
++    return 0;
++}
++
++#endif  // EBCS
++
+ static int nl80211_tx_mgmt(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
+@@ -11445,6 +11643,17 @@ static int nl80211_tx_mgmt(struct sk_buff *skb, struct genl_info *info)
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++#if 1   // EBCS
++    memset(&(params.rate), 0, sizeof(params.rate));
++    if (info->attrs[NL80211_ATTR_EBCS_TXRATE]) {
++        err = nl80211_parse_ebcs_txrate(info, &params, wdev->netdev);
++        if (err) {
++            printk("%s[%d]: nl80211_parse_ebcs_txrate() returns %d.\n", __func__, __LINE__, err);
++            return err;
++        }
++    }
++#endif  // EBCS
++
+ 	if (info->attrs[NL80211_ATTR_DURATION]) {
+ 		if (!(rdev->wiphy.flags & WIPHY_FLAG_OFFCHAN_TX))
+ 			return -EINVAL;
